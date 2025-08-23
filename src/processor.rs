@@ -43,5 +43,32 @@ impl Processor {
             }
         }
     }
+    fn process_init_escrow(
+        accounts: &[AccountInfo],
+        program_id: &Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+
+        let initializer = next_account_info(account_info_iter)?;
+        let escrow_account = next_account_info(account_info_iter)?;
+        let seller = next_account_info(account_info_iter)?;
+        let mint = next_account_info(account_info_iter)?;
+
+        let mut escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
+        if escrow_info.is_initialized {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+
+        escrow_info.is_initialized = true;
+        escrow_info.initializer = *initializer.key;
+        escrow_info.seller = *seller.key;
+        escrow_info.mint = *mint.key;
+        escrow_info.amount = amount;
+        escrow_info.seller_confirmed = false;
+
+        escrow_info.serialize(&mut *escrow_account.data.borrow_mut())?;
+        Ok(())
+    }
     
 }
