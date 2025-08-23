@@ -70,5 +70,57 @@ impl Processor {
         escrow_info.serialize(&mut *escrow_account.data.borrow_mut())?;
         Ok(())
     }
-    
+    fn process_seller_confirm(
+        accounts: &[AccountInfo],
+        _program_id: &Pubkey,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let seller = next_account_info(account_info_iter)?;
+        let escrow_account = next_account_info(account_info_iter)?;
+
+        let mut escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
+        if escrow_info.seller != *seller.key {
+            return Err(EscrowError::Unauthorized.into());
+        }
+        if escrow_info.seller_confirmed {
+            return Err(EscrowError::AlreadyConfirmed.into());
+        }
+
+        escrow_info.seller_confirmed = true;
+        escrow_info.serialize(&mut *escrow_account.data.borrow_mut())?;
+        Ok(())
+    }
+    fn process_release(accounts: &[AccountInfo], _program_id: &Pubkey) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let initializer = next_account_info(account_info_iter)?;
+        let seller = next_account_info(account_info_iter)?;
+        let escrow_account = next_account_info(account_info_iter)?;
+
+        let escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
+        if !escrow_info.seller_confirmed {
+            return Err(EscrowError::NotConfirmed.into());
+        }
+
+        // Here you'd invoke token::transfer CPI from vault to seller_ata
+        // Using invoke_signed with PDA seeds
+
+        Ok(())
+    }
+
+    fn process_cancel(accounts: &[AccountInfo], _program_id: &Pubkey) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let initializer = next_account_info(account_info_iter)?;
+        let escrow_account = next_account_info(account_info_iter)?;
+
+        let escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
+        if escrow_info.initializer != *initializer.key {
+            return Err(EscrowError::Unauthorized.into());
+        }
+        if escrow_info.seller_confirmed {
+            return Err(EscrowError::AlreadyConfirmed.into());
+        }
+
+        // Transfer tokens back to initializer here
+        Ok(())
+    }
 }
