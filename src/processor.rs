@@ -1,126 +1,278 @@
+//! Program processor
+
 use solana_program::{
     account_info::{next_account_info, AccountInfo},
     entrypoint::ProgramResult,
-    pubkey::Pubkey,
     msg,
+    program::{invoke, invoke_signed},
     program_error::ProgramError,
-    program_pack::Pack,
-    program::invoke_signed,
+    program_pack::{IsInitialized, Pack},
+    pubkey::Pubkey,
+    sysvar::{rent::Rent, Sysvar},
+};
+use spl_token::state::Account as TokenAccount;
+
+use crate::{
+    error::EscrowError,
+    instruction::EscrowInstruction,
+    state::Escrow,
 };
 
-use crate::instruction::EscrowInstruction;
-use crate::state::Escrow;
-use crate::error::EscrowError;
-use borsh::{BorshDeserialize, BorshSerialize};
-
 pub struct Processor;
-
 impl Processor {
     pub fn process(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        let instruction = EscrowInstruction::try_from_slice(instruction_data)
-            .map_err(|_| EscrowError::InvalidInstruction)?;
+        let instruction = EscrowInstruction::unpack(instruction_data)?;
 
         match instruction {
             EscrowInstruction::InitEscrow { amount } => {
                 msg!("Instruction: InitEscrow");
-                Self::process_init_escrow(accounts, program_id, amount)
+                Self::process_init_escrow(accounts, amount, program_id)
             }
-            EscrowInstruction::SellerConfirm {} => {
-                msg!("Instruction: SellerConfirm");
-                Self::process_seller_confirm(accounts, program_id)
+            EscrowInstruction::Exchange { amount } => {
+                msg!("Instruction: Exchange");
+                Self::process_exchange(accounts, amount, program_id)
             }
-            EscrowInstruction::Release {} => {
-                msg!("Instruction: Release");
-                Self::process_release(accounts, program_id)
-            }
-            EscrowInstruction::Cancel {} => {
+            EscrowInstruction::Cancel => {
                 msg!("Instruction: Cancel");
                 Self::process_cancel(accounts, program_id)
             }
         }
     }
+
     fn process_init_escrow(
         accounts: &[AccountInfo],
-        program_id: &Pubkey,
         amount: u64,
+        program_id: &Pubkey,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
-
         let initializer = next_account_info(account_info_iter)?;
-        let escrow_account = next_account_info(account_info_iter)?;
-        let seller = next_account_info(account_info_iter)?;
-        let mint = next_account_info(account_info_iter)?;
 
-        let mut escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
-        if escrow_info.is_initialized {
-            return Err(ProgramError::AccountAlreadyInitialized);
+        if !initializer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let temp_token_account = next_account_info(account_info_iter)?;
+        let initializer_token_account = next_account_info(account_info_iter)?;
+        let escrow_account = next_account_info(account_info_iter)?;
+        let rent = &Rent::from_account_info(next_account_info(account_info_iter)?)?;
+        let token_program = next_account_info(account_info_iter)?;
+
+        if !rent.is_exempt(escrow_account.lamports(), escrow_account.data_len()) {
+            return Err(EscrowError::NotRentExempt.into());
+        }
+
+        let mut escrow_info = Escrow::unpack_unchecked(&escrow_account.data.borrow())?;
+        if escrow_info.is_initialized() {
+            return Err(EscrowError::AlreadyInitialized.into());
+        }
+
+        let temp_token_account_info = TokenAccount::unpack(&temp_token_account.data.borrow())?;
+        if temp_token_account_info.owner != *initializer.key {
+            return Err(EscrowError::InvalidOwner.into());
+        }
+        if temp_token_account_info.amount == 0 {
+            msg!("Initializer's temp token account has no tokens");
+            return Err(EscrowError::ExpectedAmountMismatch.into());
+        }
+        
+        let initializer_token_account_info = TokenAccount::unpack(&initializer_token_account.data.borrow())?;
+        if temp_token_account_info.mint != initializer_token_account_info.mint {
+            return Err(ProgramError::InvalidAccountData);
         }
 
         escrow_info.is_initialized = true;
-        escrow_info.initializer = *initializer.key;
-        escrow_info.seller = *seller.key;
-        escrow_info.mint = *mint.key;
-        escrow_info.amount = amount;
-        escrow_info.seller_confirmed = false;
+        escrow_info.initializer_pubkey = *initializer.key;
+        escrow_info.temp_token_account_pubkey = *temp_token_account.key;
+        escrow_info.expected_amount = amount;
 
-        escrow_info.serialize(&mut *escrow_account.data.borrow_mut())?;
+        Escrow::pack(escrow_info, &mut escrow_account.data.borrow_mut())?;
+
+        let (pda, _bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+
+        let owner_change_ix = spl_token::instruction::set_authority(
+            token_program.key,
+            temp_token_account.key,
+            Some(&pda),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            initializer.key,
+            &[&initializer.key],
+        )?;
+
+        msg!("Calling the token program to transfer token account ownership to PDA");
+        invoke(
+            &owner_change_ix,
+            &[
+                temp_token_account.clone(),
+                initializer.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
         Ok(())
     }
-    fn process_seller_confirm(
+
+    fn process_exchange(
         accounts: &[AccountInfo],
-        _program_id: &Pubkey,
+        amount_expected_by_taker: u64,
+        program_id: &Pubkey,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
-        let seller = next_account_info(account_info_iter)?;
+        let taker = next_account_info(account_info_iter)?;
+
+        if !taker.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let takers_token_account = next_account_info(account_info_iter)?;
+        let pda_temp_token_account = next_account_info(account_info_iter)?;
         let escrow_account = next_account_info(account_info_iter)?;
+        let initializers_main_account = next_account_info(account_info_iter)?;
+        let pda_account = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
 
-        let mut escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
-        if escrow_info.seller != *seller.key {
-            return Err(EscrowError::Unauthorized.into());
+        let escrow_info = Escrow::unpack(&escrow_account.data.borrow())?;
+
+        if escrow_info.temp_token_account_pubkey != *pda_temp_token_account.key {
+            return Err(EscrowError::AuthorityMismatch.into());
         }
-        if escrow_info.seller_confirmed {
-            return Err(EscrowError::AlreadyConfirmed.into());
+        if escrow_info.initializer_pubkey != *initializers_main_account.key {
+            return Err(EscrowError::AuthorityMismatch.into());
         }
 
-        escrow_info.seller_confirmed = true;
-        escrow_info.serialize(&mut *escrow_account.data.borrow_mut())?;
+        let (pda, bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+        if pda != *pda_account.key {
+            return Err(EscrowError::AuthorityMismatch.into());
+        }
+
+        let pda_temp_token_account_info = TokenAccount::unpack(&pda_temp_token_account.data.borrow())?;
+        if amount_expected_by_taker != pda_temp_token_account_info.amount {
+            return Err(EscrowError::ExpectedAmountMismatch.into());
+        }
+
+        msg!("Transferring SOL from taker to initializer");
+        let transfer_to_initializer_ix = solana_program::system_instruction::transfer(
+            taker.key,
+            initializers_main_account.key,
+            escrow_info.expected_amount,
+        );
+        invoke(
+            &transfer_to_initializer_ix,
+            &[
+                taker.clone(),
+                initializers_main_account.clone(),
+                system_program.clone(),
+            ],
+        )?;
+
+        msg!("Transferring tokens from PDA to taker");
+        let transfer_to_taker_ix = spl_token::instruction::transfer(
+            token_program.key,
+            pda_temp_token_account.key,
+            takers_token_account.key,
+            &pda,
+            &[&pda],
+            pda_temp_token_account_info.amount,
+        )?;
+        invoke_signed(
+            &transfer_to_taker_ix,
+            &[
+                token_program.clone(),
+                pda_temp_token_account.clone(),
+                takers_token_account.clone(),
+                pda_account.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+        msg!("Closing PDA's temporary token account");
+        let close_pdas_temp_acc_ix = spl_token::instruction::close_account(
+            token_program.key,
+            pda_temp_token_account.key,
+            initializers_main_account.key,
+            &pda,
+            &[&pda],
+        )?;
+        invoke_signed(
+            &close_pdas_temp_acc_ix,
+            &[
+                token_program.clone(),
+                pda_temp_token_account.clone(),
+                initializers_main_account.clone(),
+                pda_account.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+        msg!("Closing escrow account");
+        **initializers_main_account.lamports.borrow_mut() = initializers_main_account
+            .lamports()
+            .checked_add(escrow_account.lamports())
+            .ok_or(EscrowError::ExpectedAmountMismatch)?;
+        **escrow_account.lamports.borrow_mut() = 0;
+        *escrow_account.data.borrow_mut() = &mut [];
+
         Ok(())
     }
-    fn process_release(accounts: &[AccountInfo], _program_id: &Pubkey) -> ProgramResult {
+
+    fn process_cancel(accounts: &[AccountInfo], program_id: &Pubkey) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let initializer = next_account_info(account_info_iter)?;
-        let seller = next_account_info(account_info_iter)?;
+
+        if !initializer.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        let pda_temp_token_account = next_account_info(account_info_iter)?;
         let escrow_account = next_account_info(account_info_iter)?;
+        let pda_account = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
 
-        let escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
-        if !escrow_info.seller_confirmed {
-            return Err(EscrowError::NotConfirmed.into());
+        let escrow_info = Escrow::unpack(&escrow_account.data.borrow())?;
+
+        if escrow_info.initializer_pubkey != *initializer.key {
+            return Err(EscrowError::AuthorityMismatch.into());
+        }
+        if escrow_info.temp_token_account_pubkey != *pda_temp_token_account.key {
+            return Err(EscrowError::AuthorityMismatch.into());
         }
 
-        // Here you'd invoke token::transfer CPI from vault to seller_ata
-        // Using invoke_signed with PDA seeds
-
-        Ok(())
-    }
-
-    fn process_cancel(accounts: &[AccountInfo], _program_id: &Pubkey) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let initializer = next_account_info(account_info_iter)?;
-        let escrow_account = next_account_info(account_info_iter)?;
-
-        let escrow_info = Escrow::try_from_slice(&escrow_account.data.borrow())?;
-        if escrow_info.initializer != *initializer.key {
-            return Err(EscrowError::Unauthorized.into());
-        }
-        if escrow_info.seller_confirmed {
-            return Err(EscrowError::AlreadyConfirmed.into());
+        let (pda, bump_seed) = Pubkey::find_program_address(&[b"escrow"], program_id);
+        if pda != *pda_account.key {
+            return Err(EscrowError::AuthorityMismatch.into());
         }
 
-        // Transfer tokens back to initializer here
+        msg!("Returning token account ownership to initializer");
+        let owner_change_ix = spl_token::instruction::set_authority(
+            token_program.key,
+            pda_temp_token_account.key,
+            Some(initializer.key),
+            spl_token::instruction::AuthorityType::AccountOwner,
+            &pda,
+            &[&pda],
+        )?;
+        invoke_signed(
+            &owner_change_ix,
+            &[
+                pda_temp_token_account.clone(),
+                pda_account.clone(),
+                token_program.clone(),
+            ],
+            &[&[&b"escrow"[..], &[bump_seed]]],
+        )?;
+
+        msg!("Closing escrow account");
+        **initializer.lamports.borrow_mut() = initializer
+            .lamports()
+            .checked_add(escrow_account.lamports())
+            .ok_or(EscrowError::ExpectedAmountMismatch)?;
+        **escrow_account.lamports.borrow_mut() = 0;
+        *escrow_account.data.borrow_mut() = &mut [];
+
         Ok(())
     }
 }
