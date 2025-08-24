@@ -73,7 +73,7 @@ We welcome several types of contributions:
 
 ```bash
 # Clone your fork
-git clone https://github.com/YOUR-USERNAME/Escrow-Program-Solana.git
+git clone https://github.com/0x-Professor/Escrow-Program-Solana.git
 cd Escrow-Program-Solana
 
 # Install Solana CLI tools
